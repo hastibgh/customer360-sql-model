@@ -1,0 +1,136 @@
+-- Switch to personal database
+USE hastib_db;
+
+-- Create customer360 schema in personal database
+IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'customer360') BEGIN EXEC('CREATE SCHEMA customer360') END;
+
+-- Drop existing table if not null
+IF OBJECT_ID('customer360.customer360', 'U') IS NOT NULL BEGIN DROP TABLE customer360.customer360 END;
+
+-- Create customer360 table in customer360 schema
+-- 1. Add static customer/conversion data
+WITH static_customer AS (
+    SELECT
+        cd.customer_id,
+        cs.fk_customer,
+        cd.first_name,
+        cd.last_name,
+        cs.conversion_id,
+        ROW_NUMBER() OVER(PARTITION BY cd.customer_id ORDER BY cs.conversion_date) AS conversion_number,
+        cs.conversion_type,
+        cs.conversion_date,
+        dd.year_week AS conversion_week,
+        LEAD(dd.year_week) OVER (PARTITION BY cd.customer_id ORDER BY cs.conversion_date ) AS next_conversion_week,
+        cs.conversion_channel
+    FROM mban_db.fact_tables.conversions AS cs
+    JOIN mban_db.dimensions.customer_dimension AS cd ON cs.fk_customer = cd.sk_customer
+    JOIN mban_db.dimensions.date_dimension AS dd ON cs.fk_conversion_date = dd.sk_date
+),
+-- 2. Identify the first order placed within the conversion window
+    first_order_data AS (
+    SELECT
+        sc.conversion_id,
+        dd.year_week AS first_order_week,
+        od.order_number AS first_order_number,
+        pd.product_name AS first_order_product,
+        od.price_paid AS first_week_total_paid,
+        ROW_NUMBER() OVER (PARTITION BY sc.conversion_id ORDER BY od.fk_order_date) AS row_number
+    FROM static_customer AS sc
+    JOIN mban_db.fact_tables.orders AS od
+        ON sc.fk_customer = od.fk_customer
+    JOIN mban_db.dimensions.date_dimension dd
+        ON od.fk_order_date = dd.sk_date
+    JOIN mban_db.dimensions.product_dimension pd
+        ON od.fk_product = pd.sk_product
+    WHERE dd.year_week >= sc.conversion_week
+      AND (sc.next_conversion_week IS NULL OR dd.year_week < sc.next_conversion_week)
+),
+-- 3. Keep only the first order per conversion
+    first_orders_filtered AS (
+    SELECT
+        conversion_id,
+        first_order_week,
+        first_order_number,
+        first_order_product,
+        first_week_total_paid
+    FROM first_order_data
+    WHERE row_number = 1
+),
+-- 4. Create a list of all distinct weeks in the calendar
+    week_calendar AS (
+    SELECT DISTINCT
+        dd.year_week
+    FROM mban_db.dimensions.date_dimension AS dd
+),
+-- 5. Expand each conversion into a row per week it was active
+    conversion_week_expanded AS (
+    SELECT
+        sc.*,
+        wc.year_week AS order_week,
+        DENSE_RANK() OVER (PARTITION BY sc.conversion_id ORDER BY wc.year_week) AS week_counter
+    FROM static_customer AS sc
+    JOIN week_calendar wc
+      ON wc.year_week >= sc.conversion_week
+     AND wc.year_week < ISNULL(sc.next_conversion_week, '2099-W01')
+),
+-- 6. Aggregate weekly revenue metrics per customer
+    order_data AS (
+    SELECT
+        od.fk_customer,
+        dd.year_week,
+        SUM(od.unit_price) AS total_before_discounts,
+        SUM(od.discount_value) AS total_discounts,
+        SUM(od.price_paid) AS total_paid
+    FROM mban_db.fact_tables.orders AS od
+    JOIN mban_db.dimensions.date_dimension AS dd
+        ON od.fk_order_date = dd.sk_date
+    GROUP BY od.fk_customer,
+             dd.year_week
+),
+-- 7. Join expanded conversion weeks with weekly order revenue
+    conversion_orders_joined AS (
+    SELECT
+        cwe.*,
+        ISNULL(odd.total_before_discounts, 0) AS total_before_discounts,
+        ISNULL(odd.total_discounts, 0) AS total_discounts,
+        ISNULL(odd.total_paid, 0) AS total_paid_in_week
+    FROM conversion_week_expanded AS cwe
+    LEFT JOIN order_data odd
+        ON cwe.fk_customer = odd.fk_customer AND cwe.order_week = odd.year_week
+),
+-- 8. Add cumulative revenue and order flags
+    final_with_cumulative AS (
+    SELECT
+        *,
+        SUM(total_paid_in_week) OVER (PARTITION BY conversion_id ORDER BY order_week) AS conversion_cumulative_revenue,
+        SUM(total_paid_in_week) OVER (PARTITION BY customer_id ORDER BY order_week) AS lifetime_cumulative_revenue,
+        CASE WHEN total_before_discounts > 0 THEN 1 ELSE 0 END AS orders_placed
+    FROM conversion_orders_joined
+)
+-- Final select into customer360 table
+SELECT
+    f.customer_id,
+    f.first_name,
+    f.last_name,
+    f.conversion_id,
+    f.conversion_number,
+    f.conversion_type,
+    f.conversion_date,
+    f.conversion_week,
+    f.next_conversion_week,
+    f.conversion_channel,
+    fod.first_order_week,
+    fod.first_order_number,
+    fod.first_order_product,
+    fod.first_week_total_paid as first_order_total_paid,
+    f.week_counter,
+    f.order_week,
+    f.orders_placed AS order_placed,
+    f.total_before_discounts,
+    f.total_discounts,
+    f.total_paid_in_week AS total_paid,
+    f.conversion_cumulative_revenue AS conversion_cum_revenue,
+    f.lifetime_cumulative_revenue AS customer_cum_revenue
+INTO customer360.customer360
+FROM final_with_cumulative f
+LEFT JOIN first_orders_filtered fod ON f.conversion_id = fod.conversion_id;

@@ -1,5 +1,5 @@
 # Customer360 SQL Data Model
-A multi-source SQL data model that integrates five datasets — conversions, orders, customers, products, and dates — into a unified Customer360 table.
+A multi-source SQL data model that integrates five datasets — conversions, orders, customers, products, and dates, into a unified Customer360 table.
 
 ## What it does
 - Tracks each customer's full conversion history
